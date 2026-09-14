@@ -1,0 +1,90 @@
+version: "3.9"
+
+# Reproducible local 3-node cluster.
+#
+#   docker compose up -d --build      # start the cluster
+#   docker compose stop node2         # simulate a follower/leader crash
+#   docker compose start node2        # restart it, should catch up
+#   docker compose logs -f node1      # inspect logs
+#   docker compose run --rm benchmark # run the benchmark tool against it
+#   docker compose down -v            # stop and wipe persistent volumes
+#
+# Requires proto/kvpb, proto/raftpb, and go.sum to already be generated -
+# see README "Setup".
+
+services:
+  node1:
+    build: .
+    container_name: kv-node1
+    environment:
+      NODE_ID: node1
+      RAFT_ADDR: 0.0.0.0:8101
+      CLIENT_ADDR: 0.0.0.0:9101
+      DATA_DIR: /data
+      PEERS: "node2=node2:8102|node2:9102,node3=node3:8103|node3:9103"
+      SNAPSHOT_THRESHOLD: "10000"
+      FSYNC_ON_APPEND: "true"
+    ports:
+      - "9101:9101"
+    volumes:
+      - node1-data:/data
+    networks: [kv-net]
+
+  node2:
+    build: .
+    container_name: kv-node2
+    environment:
+      NODE_ID: node2
+      RAFT_ADDR: 0.0.0.0:8102
+      CLIENT_ADDR: 0.0.0.0:9102
+      DATA_DIR: /data
+      PEERS: "node1=node1:8101|node1:9101,node3=node3:8103|node3:9103"
+      SNAPSHOT_THRESHOLD: "10000"
+      FSYNC_ON_APPEND: "true"
+    ports:
+      - "9102:9102"
+    volumes:
+      - node2-data:/data
+    networks: [kv-net]
+
+  node3:
+    build: .
+    container_name: kv-node3
+    environment:
+      NODE_ID: node3
+      RAFT_ADDR: 0.0.0.0:8103
+      CLIENT_ADDR: 0.0.0.0:9103
+      DATA_DIR: /data
+      PEERS: "node1=node1:8101|node1:9101,node2=node2:8102|node2:9102"
+      SNAPSHOT_THRESHOLD: "10000"
+      FSYNC_ON_APPEND: "true"
+    ports:
+      - "9103:9103"
+    volumes:
+      - node3-data:/data
+    networks: [kv-net]
+
+  benchmark:
+    build: .
+    entrypoint: ["/usr/local/bin/benchmark"]
+    command:
+      - "-endpoints=node1:9101,node2:9102,node3:9103"
+      - "-duration=60s"
+      - "-concurrency=32"
+      - "-key-size=16"
+      - "-value-size=128"
+      - "-write-ratio=1.0"
+      - "-json-out=/results/results.json"
+    volumes:
+      - ./results:/results
+    networks: [kv-net]
+    depends_on: [node1, node2, node3]
+
+networks:
+  kv-net:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

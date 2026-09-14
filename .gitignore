@@ -1,0 +1,25 @@
+# Build outputs
+bin/
+dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Runtime data / benchmark output
+data/
+results/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets / local env
+.env
+.env.*
+
+# NOTE: generated protobuf Go sources under proto/kvpb and proto/raftpb
+# should be committed so a fresh clone builds without protoc installed.
