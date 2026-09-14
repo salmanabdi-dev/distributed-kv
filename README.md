@@ -1,430 +1,399 @@
-# distributed-kv
+# Distributed Key-Value Store
 
-A linearizable, replicated key-value store built from scratch in Go, using
-the Raft consensus algorithm, gRPC/Protocol Buffers for all node-to-node
-and client-facing communication, and an embedded LSM storage engine
-(Pebble) for persistence.
+A linearizable, replicated key-value store built from scratch in Go. The system uses the Raft consensus algorithm for leader election and log replication, gRPC and Protocol Buffers for communication, and Pebble for persistent storage.
 
->
-## Contents
+The project explores the core problems behind fault-tolerant distributed systems: maintaining consistency across nodes, surviving failures, persisting consensus state, recovering lagging replicas, and serving strongly consistent reads.
 
-- [Architecture](#architecture)
-- [Raft consensus](#raft-consensus)
-- [Linearizable reads](#linearizable-reads)
-- [Persistent storage](#persistent-storage)
-- [Snapshots and log compaction](#snapshots-and-log-compaction)
-- [Fault tolerance](#fault-tolerance)
-- [gRPC API](#grpc-api)
-- [Setup](#setup)
-- [Running the cluster](#running-the-cluster)
-- [Benchmarking](#benchmarking)
-- [Testing](#testing)
-- [Tradeoffs and limitations](#tradeoffs-and-limitations)
-- [Scaling considerations](#scaling-considerations)
+## Features
+
+- Raft leader election and log replication
+- Linearizable reads using ReadIndex
+- Persistent Raft state and replicated key-value data
+- gRPC communication between nodes and clients
+- Snapshotting and Raft log compaction
+- Snapshot-based recovery for lagging followers
+- Leader failover and follower recovery
+- Concurrent client writes
+- Docker-based three-node deployment
+- Unit, integration, failover, snapshot, and race-detection tests
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph Client
-        C[gRPC client / benchmark tool]
-    end
-    subgraph Node1["Node (any of 3)"]
-        CS[KVService<br/>client_server.go]
-        RS[RaftService<br/>raft_server.go]
-        RN[raft.Node<br/>consensus core]
-        SM[kv.StateMachine]
-        PL[raft.PersistentLog]
-        SS[raft.SnapshotStore]
-        ENG1[(Pebble: raft log)]
-        ENG2[(Pebble: kv data)]
-    end
-    C -->|Put/Get/Delete| CS
-    CS --> RN
-    RN --> PL
-    RN --> SM
-    RN --> SS
-    PL --> ENG1
-    SM --> ENG2
-    RS <-->|RequestVote / AppendEntries / InstallSnapshot| RN
+The cluster consists of three independent nodes. Each node runs a Raft consensus instance, a persistent log, a key-value state machine, and two gRPC services.
+
+```text
+                         Client
+                           |
+                           v
+                    +-------------+
+                    |  KVService  |
+                    +-------------+
+                           |
+                           v
+                    +-------------+
+                    |  Raft Node  |
+                    +-------------+
+                     /           \
+                    /             \
+             AppendEntries     AppendEntries
+                  /                 \
+                 v                   v
+          +-------------+     +-------------+
+          |   Node 2    |     |   Node 3    |
+          |    Raft     |     |    Raft     |
+          +-------------+     +-------------+
+
+              Persistent storage on each node
+                  Pebble + Snapshots
 ```
 
-Three independent processes (`cmd/node`) form a cluster. Each exposes two
-gRPC services on two separate ports:
+Each node exposes two services:
 
-- **KVService** (client-facing): `Put`, `Get`, `Delete`.
-- **RaftService** (internal): `RequestVote`, `AppendEntries`,
-  `InstallSnapshot`.
+- **KVService** — client-facing `Put`, `Get`, and `Delete`
+- **RaftService** — internal `RequestVote`, `AppendEntries`, and `InstallSnapshot`
 
-`internal/raft` implements consensus with **no dependency on gRPC or
-generated protobuf code** - it defines its own request/response structs and
-a `Transport` interface. `internal/server` is the thin adapter that
-translates between generated protobuf types and `internal/raft`'s types,
-and hosts the actual gRPC servers/clients. This separation means the
-consensus algorithm can be (and is, in `internal/raft/cluster_test.go`)
-tested with a fake in-process transport, independent of gRPC generation.
+The consensus implementation in `internal/raft` is separated from the gRPC layer. Raft communicates through a `Transport` interface, while `internal/server` adapts those requests to gRPC and Protocol Buffers.
 
-```mermaid
-flowchart TB
-    subgraph "Cluster topology (3 nodes)"
-        N1((node1)) <-->|Raft RPCs| N2((node2))
-        N2 <-->|Raft RPCs| N3((node3))
-        N1 <-->|Raft RPCs| N3
-    end
+This keeps the consensus algorithm independent of the network implementation and allows it to be tested with an in-process transport.
+
+## Raft Consensus
+
+The Raft implementation is located in `internal/raft`.
+
+### Leader Election
+
+Nodes begin as followers and use randomized election timeouts. If a follower stops receiving heartbeats, it becomes a candidate, increments its term, votes for itself, and requests votes from the other nodes.
+
+A candidate becomes leader after receiving votes from a majority of the cluster.
+
+The implementation includes:
+
+- randomized election timeouts
+- persistent terms and votes
+- Raft log up-to-date checks
+- term-based leader step-down
+- majority-based elections
+
+### Log Replication
+
+Client writes are sent to the leader and appended to its Raft log.
+
+The leader replicates entries to followers using `AppendEntries`. An entry becomes committed after it has been replicated to a majority of the cluster according to Raft's commit rules.
+
+Replication includes:
+
+- `prevLogIndex` / `prevLogTerm` consistency checks
+- conflicting-entry detection
+- conflict-term fast backtracking
+- per-follower `nextIndex` and `matchIndex`
+- majority-based commit advancement
+
+Once committed, entries are applied to the key-value state machine.
+
+## Client Request Flow
+
+A typical write follows this path:
+
+```text
+Client
+  |
+  | Put(key, value)
+  v
+Leader
+  |
+  | append to Raft log
+  |
+  +-----------> Follower
+  |
+  +-----------> Follower
+  |
+  | majority replication
+  v
+Commit
+  |
+  v
+Apply to state machine
+  |
+  v
+Return OK
 ```
 
-### Client request flow
+If a client contacts a follower for a write, the follower returns `NOT_LEADER` along with a leader hint rather than forwarding the request internally.
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Leader
-    participant Follower1
-    participant Follower2
-    Client->>Leader: Put(key, value)
-    Leader->>Leader: append to local log
-    par replicate
-        Leader->>Follower1: AppendEntries
-        Leader->>Follower2: AppendEntries
-    end
-    Follower1-->>Leader: success
-    Follower2-->>Leader: success
-    Leader->>Leader: majority reached -> commit
-    Leader->>Leader: apply to state machine
-    Leader-->>Client: PutResponse{OK}
+Once the client knows the current leader, future writes can be sent directly to it.
+
+## Linearizable Reads
+
+Strongly consistent reads use a ReadIndex-style approach instead of writing a no-op log entry for every read.
+
+For a linearizable read, the leader:
+
+1. Records its current commit index.
+2. Confirms that it still holds leadership by contacting a majority of the cluster in the current term.
+3. Waits until its state machine has applied through the required commit index.
+4. Returns the requested value.
+
+This provides strongly consistent reads without adding a new log entry for every `Get`.
+
+Clients may also request non-linearizable reads from any node when stale data is acceptable.
+
+## Persistent Storage
+
+The project uses [Pebble](https://github.com/cockroachdb/pebble), an embedded LSM-tree key-value engine written in Go.
+
+Each node maintains separate persistent stores for:
+
+```text
+raftlog/
+    Raft log entries
+    current term
+    voted-for state
+    snapshot metadata
+
+kvdata/
+    committed key-value data
 ```
 
-If a client contacts a non-leader node, that node returns
-`NOT_LEADER` with a `leader_hint` (the leader's client-facing address)
-rather than silently forwarding the request. This keeps the hot write path
-to a single network hop once a client has learned the current leader
-(exactly what `cmd/benchmark` does), at the cost of one extra round trip
-the first time / after a leadership change.
+The Raft layer depends on a small storage interface rather than directly depending on Pebble, allowing another storage engine to be substituted by implementing the same interface.
 
-## Raft consensus
+Raft metadata and log entries are persisted before being treated as durable.
 
-Implemented per the original Raft paper (Ongaro & Ousterhout, 2014) in
-`internal/raft`:
+## Snapshots and Log Compaction
 
-- **Leader election**: `election.go` - randomized election timeouts
-  (`ElectionTimeoutMin`/`Max`, default 300-600ms), `RequestVote` RPC with
-  the standard log-up-to-date comparison, term-based step-down.
-- **Log replication**: `replication.go` - `AppendEntries` RPC with
-  `prevLogIndex`/`prevLogTerm` consistency checks, conflict detection with
-  the fast-backtracking optimization (follower returns the conflicting
-  term and its first index so the leader can jump `nextIndex` in one round
-  trip), and majority-based commit index advancement that respects the
-  "leader completeness" rule (a leader only counts a majority for entries
-  from its **own** current term; older-term entries commit implicitly once
-  a current-term entry does).
-- **Persistent state**: `log.go` - `currentTerm`, `votedFor`, and the log
-  itself, all durable (see [Persistent storage](#persistent-storage)).
-- **Volatile state**: `commitIndex`, `lastApplied`, and (leader-only)
-  `nextIndex`/`matchIndex` per peer, held in `raft.Node`.
+Without compaction, the Raft log would grow indefinitely.
 
-## Linearizable reads
+After a configurable number of applied entries, a node creates a snapshot containing:
 
-**Chosen approach: ReadIndex** (`readindex.go`), not a committed no-op log
-entry per read.
+- the current key-value state
+- the last included Raft log index
+- the last included Raft log term
 
-Rationale: a log-entry-per-read approach (some early Raft
-implementations) is simplest to reason about but pays the full disk-fsync
-and replication cost of a write for every read, which would be wasteful
-for a read-heavy workload and directly hurts the write-throughput target
-by competing for the same log/replication pipeline. ReadIndex instead:
+Entries covered by the snapshot can then be compacted from the persistent log.
 
-1. Records the current `commitIndex` as the read's target index.
-2. Confirms this node is still leader by exchanging one heartbeat round
-   with a majority of peers *in the current term* - if a majority responds
-   in the same term, no other node could have since been elected leader
-   (an election requires a majority vote, and any newer leader's
-   heartbeat would have already caused this node to step down before it
-   could get a majority of confirmations).
-3. Waits for local `lastApplied >= readIndex` (usually already true) before
-   answering from local state.
+If a follower falls too far behind and the leader no longer has the required log entries, the leader sends an `InstallSnapshot` request instead of replaying unavailable history.
 
-This makes `Get(..., linearizable=true)` a leader-only operation with no
-log write at all, at the cost of one RPC round-trip per read for step 2
-(itself often piggybacked with the leader's regular heartbeats -
-`confirmLeadership` reuses the same `AppendEntries` RPC).
+Nodes can also restore their state from local snapshots during startup.
 
-A client may also request a **non-linearizable** read (`linearizable=false`)
-against any node, served directly from that node's local (possibly stale)
-applied state - useful for read-heavy workloads that can tolerate eventual
-consistency in exchange for no cross-node round trip at all. Followers
-always reject `linearizable=true` requests with `NOT_LEADER`
-(`tests/raft_test.go::TestFollowerRejectsLinearizableRead`), since only the
-leader can execute the ReadIndex protocol.
+## Fault Tolerance
 
-## Persistent storage
+The test suite exercises several failure and recovery scenarios:
 
-**Storage engine: [Pebble](https://github.com/cockroachdb/pebble)**
-(`internal/storage/pebble.go`), a pure-Go, embedded LSM-tree engine
-maintained by CockroachDB, chosen over:
-
-- Real LevelDB/RocksDB cgo bindings: fragile cross-compilation, especially
-  targeting the slim/distroless Docker image used here.
-- `goleveldb`: effectively unmaintained.
-
-The consensus and state-machine layers depend only on
-`internal/storage.Engine`, a small interface (`Get`/`Set`/`Delete`/`Batch`/
-`Iterator`), not on Pebble directly - swapping in Badger or another engine
-means implementing that one interface.
-
-Each node runs **two independent Pebble instances**:
-
-| Instance | Keyspace prefix | Contents |
-|---|---|---|
-| `<data_dir>/raftlog` | `l/<index>` | Raft log entries (gob-encoded) |
-| `<data_dir>/raftlog` | `m/*` | `currentTerm`, `votedFor`, snapshot boundary |
-| `<data_dir>/kvdata` | `d/<key>` | Committed key-value pairs |
-
-Every write to `currentTerm`/`votedFor` and every log append is committed
-via a Pebble batch with `Sync: true` by default (`FSYNC_ON_APPEND=true`),
-i.e. fsynced to disk before being acknowledged as durable, satisfying the
-Raft persistence requirement (§5.6 of the paper: these must survive a
-crash before a vote is cast or an entry is counted toward a majority).
-Setting `FSYNC_ON_APPEND=false` relaxes this to batched/periodic fsync for
-higher throughput at the cost of a small durability window on OS/power
-crash (not process crash) - see [Tradeoffs](#tradeoffs-and-limitations);
-any benchmark run in that mode must report it explicitly (RESULTS.md has a
-field for this).
-
-## Snapshots and log compaction
-
-- `internal/kv/state_machine.go`'s `Dump`/`Restore` capture/replace the
-  entire KV keyspace.
-- `internal/raft/snapshot.go`'s `SnapshotStore` persists the dump plus
-  `{LastIncludedIndex, LastIncludedTerm}` to plain files (write-tmp,
-  fsync, rename - so a crash mid-write can never leave a corrupt snapshot
-  visible), separate from the two Pebble instances since snapshots are
-  large, infrequent, whole-blob writes rather than incremental KV traffic.
-- Every `SnapshotThreshold` (default 10,000) applied entries, a snapshot is
-  taken and the log is compacted up to that index
-  (`PersistentLog.CompactPrefix`).
-- A follower whose required log entries have already been compacted away
-  on the leader is caught up via `InstallSnapshot`
-  (`HandleInstallSnapshot`), which replaces its entire local state machine
-  and resets its log boundary, rather than replaying history it no longer
-  has access to.
-- On startup, a node loads its latest local snapshot (if any) before
-  accepting traffic, so state machine content and `lastApplied` are
-  correct immediately (`raft.NewNode`).
-
-## Fault tolerance
-
-Exercised in `tests/failover_test.go` and `tests/snapshot_test.go`:
-
-| Scenario | Test |
+| Scenario | Behavior |
 |---|---|
-| Follower crash, cluster stays available | `TestFollowerCrashClusterStillAvailable` |
-| Leader crash, new leader elected, data survives | `TestLeaderCrashNewLeaderElectedAndDataSurvives` |
-| Follower restart, catches up on missed writes | `TestFollowerRestartRecoversPersistedStateAndCatchesUp` |
-| Old leader steps down after rejoining with a stale term | `TestOldLeaderStepsDownAfterHigherTermDiscovered` |
-| Follower far enough behind to need a snapshot, not just log replay | `TestSnapshotInstallationRecoversFarBehindFollower` |
-| Node restores its own state from a local snapshot on restart | `TestSnapshotRestoreOnOwnRestart` |
+| Follower failure | Remaining majority continues operating |
+| Leader failure | Remaining nodes elect a new leader |
+| Follower restart | Node catches up on missed writes |
+| Old leader rejoins | Stale leader steps down after observing a newer term |
+| Severely lagging follower | State recovered through snapshot installation |
+| Node restart | Local state restored from persistent storage and snapshots |
+
+These scenarios are implemented in the integration and Raft test suites.
 
 ## gRPC API
 
-Defined in `proto/kv.proto` (client-facing `KVService`) and
-`proto/raft.proto` (internal `RaftService`) - see those files for full
-message definitions. Generated Go code lives in `proto/kvpb` and
-`proto/raftpb` after running [`scripts/generate.sh`](scripts/generate.sh).
+Protocol Buffer definitions live in:
+
+```text
+proto/kv.proto
+proto/raft.proto
+```
+
+### KVService
+
+Client-facing operations:
+
+```text
+Put
+Get
+Delete
+```
+
+### RaftService
+
+Internal consensus operations:
+
+```text
+RequestVote
+AppendEntries
+InstallSnapshot
+```
+
+Generated Go bindings are stored in:
+
+```text
+proto/kvpb/
+proto/raftpb/
+```
+
+## Project Structure
+
+```text
+distributed-kv/
+├── cmd/
+│   ├── benchmark/        # Benchmark client
+│   └── node/             # Node executable
+├── internal/
+│   ├── config/           # Node configuration
+│   ├── kv/               # Key-value state machine
+│   ├── raft/             # Raft consensus implementation
+│   ├── server/           # gRPC servers and transport
+│   └── storage/          # Persistent storage abstraction
+├── proto/                # Protocol Buffer definitions
+├── scripts/              # Setup, generation, cluster, and benchmark scripts
+├── tests/                # End-to-end integration tests
+├── Dockerfile
+├── docker-compose.yml
+├── go.mod
+└── go.sum
+```
 
 ## Setup
 
-### Windows / VS Code quick path
+### Requirements
 
-If you are opening the project in VS Code on Windows, the easiest verification path is:
+- Go
+- Protocol Buffers compiler (`protoc`)
+- `protoc-gen-go`
+- `protoc-gen-go-grpc`
+
+Install the Go protobuf plugins:
+
+```bash
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+```
+
+### Generate Protocol Buffers
+
+Linux/macOS:
+
+```bash
+./scripts/generate.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\generate.ps1
+```
+
+Then resolve dependencies:
+
+```bash
+go mod tidy
+```
+
+## Testing
+
+Run the complete test suite:
+
+```bash
+go test ./...
+```
+
+Run with Go's race detector:
+
+```bash
+go test -race ./...
+```
+
+On Windows, the project also includes a verification script:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\setup-and-test.ps1
 ```
 
-That script generates the protobuf packages, runs `go mod tidy`, formats the code,
-runs `go vet`, executes the full test suite, and then runs the race detector. Commit
-only after it finishes successfully. See `VERIFY_BEFORE_COMMIT.md` for the exact
-files and Git commands.
+The test suite covers persistent log behavior, elections, replication, concurrent writes, linearizable reads, leader failover, follower recovery, snapshots, and end-to-end communication over gRPC.
 
-This repo's `.proto` files and Go source are complete, but the generated
-protobuf/gRPC Go code (`proto/kvpb`, `proto/raftpb`) could not be produced
-inside the sandbox that maintains this repo (no network access there).
-Generate it once, locally, then commit it:
+## Running the Cluster
+
+The easiest way to start a three-node cluster is with Docker Compose:
 
 ```bash
-# 1. Install protoc and the Go plugins (one-time)
-brew install protobuf                                   # macOS
-# or: apt-get install -y protobuf-compiler               # Debian/Ubuntu
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
-export PATH="$PATH:$(go env GOPATH)/bin"
-
-# 2. Generate proto/kvpb and proto/raftpb
-./scripts/generate.sh
-# equivalent to:
-#   protoc --go_out=. --go_opt=module=github.com/salmanabdi-dev/distributed-kv \
-#          --go-grpc_out=. --go-grpc_opt=module=github.com/salmanabdi-dev/distributed-kv \
-#          proto/kv.proto proto/raft.proto
-
-# 3. Resolve and lock dependencies (populates go.sum)
-go mod tidy
-
-# 4. Build
-go build ./...
+docker compose up -d --build
 ```
 
-`proto/kvpb` and `proto/raftpb` are **committed to the repository** once
-generated (see `.gitignore`'s note) so a fresh `git clone` builds
-immediately without anyone needing `protoc` installed. Re-run
-`./scripts/generate.sh` and re-commit only when `proto/kv.proto` or
-`proto/raft.proto` change.
-
-## Running the cluster
-
-**Locally, without Docker** (3 terminals):
+View node logs:
 
 ```bash
-NODE_ID=node1 RAFT_ADDR=127.0.0.1:8101 CLIENT_ADDR=127.0.0.1:9101 \
-  PEERS="node2=127.0.0.1:8102|127.0.0.1:9102,node3=127.0.0.1:8103|127.0.0.1:9103" \
-  go run ./cmd/node
-
-NODE_ID=node2 RAFT_ADDR=127.0.0.1:8102 CLIENT_ADDR=127.0.0.1:9102 \
-  PEERS="node1=127.0.0.1:8101|127.0.0.1:9101,node3=127.0.0.1:8103|127.0.0.1:9103" \
-  go run ./cmd/node
-
-NODE_ID=node3 RAFT_ADDR=127.0.0.1:8103 CLIENT_ADDR=127.0.0.1:9103 \
-  PEERS="node1=127.0.0.1:8101|127.0.0.1:9101,node2=127.0.0.1:8102|127.0.0.1:9102" \
-  go run ./cmd/node
+docker compose logs -f
 ```
 
-**With Docker Compose:**
+Stop a node to simulate failure:
 
 ```bash
-./scripts/start_cluster.sh      # equivalent to: docker compose up -d --build
-docker compose logs -f          # inspect logs
-docker compose stop node2       # simulate a follower/leader crash
-docker compose start node2      # restart it; it should catch up
-docker compose down -v          # stop and wipe persistent volumes
+docker compose stop node2
+```
+
+Restart it:
+
+```bash
+docker compose start node2
+```
+
+Stop the cluster and remove its persistent volumes:
+
+```bash
+docker compose down -v
 ```
 
 ## Benchmarking
 
+A benchmark client is included in `cmd/benchmark`.
+
+Example:
+
 ```bash
-./scripts/benchmark.sh
-# or directly:
 go run ./cmd/benchmark \
   -endpoints=127.0.0.1:9101,127.0.0.1:9102,127.0.0.1:9103 \
-  -duration=60s -warmup=5s -concurrency=32 \
-  -key-size=16 -value-size=128 -write-ratio=1.0 \
-  -json-out=results/results.json
+  -duration=60s \
+  -warmup=5s \
+  -concurrency=32 \
+  -key-size=16 \
+  -value-size=128 \
+  -write-ratio=1.0
 ```
 
-### Methodology
+The benchmark can measure sustained and peak throughput under configurable concurrency, key size, value size, duration, and read/write workload.
 
-- A write counts as successful **only** when the client receives
-  `PutResponse{Status: OK}`, which - per `ClientServer.Put` ->
-  `raft.Node.Propose` - only happens after the entry is committed by a
-  Raft majority **and** applied to the state machine. Uncommitted,
-  timed-out, or `NOT_LEADER`-redirected attempts are never counted as
-  throughput.
-- **Sustained throughput** = mean successful writes/sec over the
-  post-warmup window (`-warmup`, default 5s, excluded). **Peak
-  throughput** = the single best 1-second window anywhere in the run.
-  `cmd/benchmark` reports both, and the target claim in `RESULTS.md` uses
-  the sustained figure only, never peak.
-- `-leader-only=true` (default) has all client goroutines discover and
-  send directly to the current leader (mirroring how a well-behaved
-  production client would cache the leader after one `NOT_LEADER`
-  redirect); `-leader-only=false` sends to random nodes to exercise the
-  redirect path itself as a measured scenario.
-- Recommended baseline sweep for the 12,000 writes/sec target: 3 nodes,
-  60s+ duration, concurrency swept across 16-64, fixed 16B key / 128B
-  value, `FSYNC_ON_APPEND=true` (durable mode) as the primary reported
-  number, with a clearly-labeled `FSYNC_ON_APPEND=false` run reported
-  separately if used at all.
-- Record alongside every run: node count, CPU, RAM, OS, Go version, key
-  size, value size, concurrency, duration, replication batch size,
-  fsync setting - see `RESULTS.md`'s template.
+A write is counted as successful only after the client receives an `OK` response following Raft commitment and application to the state machine.
 
-**Results have not yet been measured in any environment** - `RESULTS.md`
-contains the full report structure with `Not yet measured` placeholders
-and the exact commands to fill them in.
+## Design Tradeoffs
 
-## Testing
+This project intentionally keeps several aspects simpler than a production distributed database.
 
-```bash
-go test ./...
-go test -race ./...
-```
+**Static membership**
 
-- `internal/raft/log_test.go` - persistent log unit tests (append,
-  conflict truncation, term/vote durability across a simulated restart,
-  compaction), against a real Pebble-backed engine.
-- `internal/raft/cluster_test.go` - multi-node consensus correctness
-  (election, replication, follower/leader crash) using a fake in-process
-  `Transport`, so it needs no generated protobuf code.
-- `tests/*.go` - full end-to-end tests over the real gRPC stack: startup,
-  replicated PUT/DELETE, linearizable-read enforcement, failover,
-  snapshot installation, concurrent writers. These require
-  `scripts/generate.sh` + `go mod tidy` to have been run first.
+Cluster membership is configured at startup. Dynamic membership changes and Raft joint-consensus reconfiguration are not implemented.
 
-**None of these have been executed in the sandbox that produced this
-repository** (no Go toolchain there). Run them yourself and treat a green
-`go test -race ./...` as the actual correctness signal, not this
-documentation.
+**Snapshot generation**
 
-## Tradeoffs and limitations
+Creating a state-machine snapshot currently blocks concurrent state-machine application while the keyspace is captured. A production implementation could use Pebble point-in-time snapshots to reduce this interruption.
 
-- **`Node.Stop()` is idempotent and safe to call concurrently/more than
-  once** (`sync.Once`-guarded in `internal/raft/node_lifecycle.go`) - a
-  second or concurrent call is a no-op rather than a panic. This matters
-  for callers like test harnesses that stop a node explicitly to simulate
-  a crash and then stop it again during generic cleanup.
-- **Storage engines are owned by the caller, not by `raft.Node`.**
-  `raft.NewNode` takes a `storage.Engine` but does not close it in
-  `Stop()` - the process (or test) that opened it is responsible for
-  closing it, after `Node.Stop()` returns. `cmd/node/main.go` and the test
-  harnesses do this in the correct order (stop consensus goroutines, then
-  close storage, then let temp-directory cleanup run). Getting this order
-  wrong is a real, previously-hit bug: an open Pebble WAL handle at
-  cleanup time causes `TempDir` removal failures on Windows (Unix
-  tolerates deleting a still-open file; Windows does not).
-- **Idempotency is best-effort, not fully replicated.** `client_request_id`
-  is threaded through the write path and log entries but this
-  implementation does not yet maintain a replicated de-duplication table
-  in the state machine; a client retry after a leader change could in
-  principle be applied twice. Closing this gap means adding a small
-  `client_id -> last_applied_request_id` map to `kv.StateMachine` that
-  participates in snapshotting.
-- **Snapshot `Dump` blocks concurrent `Apply` calls** (it holds the state
-  machine's write lock for the duration of a full keyspace iteration). At
-  very large dataset sizes this could cause a latency spike during
-  snapshotting. A production system would instead take a Pebble-level
-  point-in-time snapshot (`pebble.DB.NewSnapshot()`) and iterate that
-  without blocking new writes.
-- **Cluster membership is static**, read from `PEERS` at startup; there is
-  no `AddServer`/`RemoveServer` joint-consensus reconfiguration (Raft
-  paper §6). Adding/removing nodes today requires a coordinated restart of
-  all nodes with updated `PEERS`.
-- **Transport security**: RaftService/KVService both currently use
-  `insecure.NewCredentials()`, appropriate for a private Docker network in
-  this exercise but not for a real deployment - production use should add
-  mTLS between nodes and TLS + auth on the client-facing service.
-- **Read-only followers cannot serve linearizable reads locally** by
-  design (see [Linearizable reads](#linearizable-reads)); a read-heavy
-  workload that needs to scale reads across followers must accept
-  eventual consistency (`linearizable=false`) for that scaling benefit.
+**Client request deduplication**
 
-## Scaling considerations
+Request IDs are carried through the write path, but the state machine does not maintain a replicated client deduplication table. A retry following a leadership change may therefore be applied more than once.
 
-- Throughput on a single Raft group is fundamentally bounded by the
-  leader's ability to replicate and the slowest-of-majority follower's
-  disk fsync latency; scaling further than one leader can sustain requires
-  **sharding into multiple Raft groups** (each owning a key range), which
-  this project does not implement.
-- `ReplicationBatchMaxEntries` and batching multiple client writes into a
-  single `AppendEntries` round trip is the main lever for pushing a single
-  group's write throughput higher without weakening consistency - see the
-  target-driven optimization notes in `RESULTS.md` once a baseline number
-  exists to optimize from.
+**Transport security**
+
+The current gRPC transport uses insecure credentials and is intended for local or private-network experimentation. A production deployment would use authentication and TLS/mTLS.
+
+**Single Raft group**
+
+All keys are managed by one Raft group. Write throughput is therefore bounded by the leader and the replication/storage pipeline. Scaling beyond a single group's capacity would require partitioning the keyspace across multiple Raft groups.
+
+## What I Learned
+
+Building the system required working through several problems that are easy to hide behind existing distributed-systems libraries:
+
+- coordinating concurrent state across multiple nodes
+- reasoning about leader changes and stale terms
+- maintaining persistent consensus state across restarts
+- handling conflicting and missing log entries
+- separating consensus logic from network transport
+- recovering replicas after failures
+- coordinating shutdown with persistent storage
+- testing concurrent distributed behavior with Go's race detector
+
+The project was built as a deeper exploration of backend infrastructure, distributed systems, concurrency, and fault-tolerant software.
