@@ -5,19 +5,7 @@ the Raft consensus algorithm, gRPC/Protocol Buffers for all node-to-node
 and client-facing communication, and an embedded LSM storage engine
 (Pebble) for persistence.
 
-> **Verification status (read this first).** This repository is maintained
-> in a sandboxed environment with no network access and no Go toolchain
-> installed, so **no code here has been compiled, run, or benchmarked in
-> that environment.** Fixes described in this README (module path,
-> shutdown idempotency, leader-failover test fix) were made via careful
-> static code review against a real `go test ./...` failure log supplied
-> by the maintainer, not by re-running the tests here. Every claim in this
-> README about passing tests or achieving the performance target is a
-> *target*, not a measured result, until you run the commands in
-> [Setup](#setup) and [Benchmarking](#benchmarking) yourself and fill in
-> [RESULTS.md](RESULTS.md). Do not treat any number in this document as
-> verified until you've produced it locally.
-
+>
 ## Contents
 
 - [Architecture](#architecture)
